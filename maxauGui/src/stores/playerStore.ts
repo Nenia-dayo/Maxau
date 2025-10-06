@@ -6,6 +6,7 @@ interface PlayerStore extends PlayerState {
   initialize: () => Promise<void>;
   getCurrentTrack: () => Track | null;
   getUpcomingTracks: () => Track[];
+  setVolume: (volume: number) => Promise<void>;
   cleanup: (() => void) | null;
   
   // 内部アクション（コンポーネントからは直接呼ばない）
@@ -40,6 +41,15 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   _setPlaylist: (playlist) => set({ playlist }),
   _setCurrentTrack: (payload) => set({ currentTrackIndex: payload.index }),
   _setPosition: (position) => set({ currentPositionSecs: position }),
+  
+  setVolume: async (volume) => {
+    try {
+      await tauriApi.setVolume(volume);
+      set({ volume });
+    } catch (error) {
+      console.error('Failed to set volume:', error);
+    }
+  },
   
   getCurrentTrack: () => {
     const { playlist, currentTrackIndex } = get();

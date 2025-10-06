@@ -11,12 +11,8 @@ use crossterm::{
     style::Stylize,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use std::{
-    io::stdout,
-    process::exit,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use parking_lot::Mutex;
+use std::{io::stdout, process::exit, sync::Arc, time::Duration};
 
 pub fn init_terminal() {
     enable_raw_mode().unwrap_or_else(|e| {
@@ -54,18 +50,21 @@ pub async fn get_input_url_mode(
     let url = url.as_str();
     init_terminal();
     loop {
-        if *key_state.lock().unwrap() {
+        if *key_state.lock() {
             break;
         }
 
-        if !poll(Duration::from_millis(POLL_INTERVAL_MS)).unwrap() {
+        if !poll(Duration::from_millis(POLL_INTERVAL_MS)).unwrap_or(false) {
             continue;
         }
 
-        let event = read().unwrap_or_else(|e| {
-            err!("Failed to read key: {}", e);
-            exit(1);
-        });
+        let event = match read() {
+            Ok(e) => e,
+            Err(e) => {
+                err!("Failed to read key: {}", e);
+                exit(1);
+            }
+        };
 
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
@@ -84,7 +83,7 @@ pub async fn get_input_url_mode(
                     return;
                 }
                 KeyCode::Char(' ') => {
-                    let play = url_player.lock().unwrap();
+                    let play = url_player.lock();
                     let msg = if play.is_paused() {
                         play.resume();
                         "|> Resumed"
@@ -131,7 +130,7 @@ pub async fn get_input(
     let path = path.as_str();
     init_terminal();
     loop {
-        if *quit.lock().unwrap() {
+        if *quit.lock() {
             return;
         }
 
@@ -161,7 +160,7 @@ pub async fn get_input(
                     return;
                 }
                 KeyCode::Char(' ') => {
-                    let mut play = music_play.lock().unwrap();
+                    let mut play = music_play.lock();
                     let msg = if play.is_paused() {
                         play.resume();
                         "|> Resumed"
@@ -178,10 +177,17 @@ pub async fn get_input(
                     adjust_volume(&music_play, -VOLUME_STEP, &filename, path, &metadata);
                 }
                 KeyCode::Char('l') => {
-                    let play = music_play.lock().unwrap();
+                    let play = music_play.lock();
                     let cur_pos = play.get_pos();
                     let new_pos = cur_pos + Duration::from_secs(SEEK_STEP_SECS);
-                    play.seek(new_pos);
+                    if play.seek(new_pos).is_err() {
+                        info_with_restore(
+                            "Seek not supported for this audio format".red().to_string(),
+                            filename.clone(),
+                            path.to_string(),
+                            metadata.clone(),
+                        );
+                    }
                     info(format!(
                         "Seeked forward ({} -> {})",
                         humantime::format_duration(cur_pos),
@@ -199,15 +205,38 @@ pub async fn get_input(
                     );
                 }
                 KeyCode::Char('h') => {
-                    let play = music_play.lock().unwrap();
+                    let play = music_play.lock();
                     let cur_pos = play.get_pos();
                     let new_pos = cur_pos.saturating_sub(Duration::from_secs(SEEK_STEP_SECS));
-                    play.seek(new_pos);
-                    info(format!(
-                        "Seeked backward ({} -> {})",
-                        humantime::format_duration(cur_pos),
-                        humantime::format_duration(new_pos)
-                    ));
+                    match play.seek(new_pos) {
+                        Ok(_) => {
+                            info_with_restore(
+                                format!(
+                                    "Seeked backward ({} -> {})",
+                                    humantime::format_duration(cur_pos),
+                                    humantime::format_duration(new_pos)
+                                ),
+                                filename.clone(),
+                                path.to_string(),
+                                metadata.clone(),
+                            );
+                        }
+                        Err(e) => {
+                            info_with_restore(
+                                format!(
+                                    "Seek failed: {:?} (pos: {}s -> {}s)",
+                                    e,
+                                    cur_pos.as_secs(),
+                                    new_pos.as_secs()
+                                )
+                                .red()
+                                .to_string(),
+                                filename.clone(),
+                                path.to_string(),
+                                metadata.clone(),
+                            );
+                        }
+                    }
                 }
                 KeyCode::Char(c) => {
                     info_with_restore(
@@ -224,7 +253,7 @@ pub async fn get_input(
 }
 
 fn adjust_volume_url(url_player: Arc<Mutex<UrlPlayer>>, delta: f32, url: &str) {
-    let play = url_player.lock().unwrap();
+    let play = url_player.lock();
     let vol = play.get_volume();
     let new_vol = (vol + delta).clamp(0.0, 1.0);
 
@@ -249,7 +278,7 @@ fn adjust_volume(
     path: &str,
     metadata: &MetaData,
 ) {
-    let mut play = music_play.lock().unwrap();
+    let mut play = music_play.lock();
     let vol = play.get_volume();
     let new_vol = (vol + delta).clamp(0.0, 1.0);
 

@@ -1,10 +1,13 @@
-// /workspaces/Maxau/minauCli/src/main.rs
-
-use clap::Parser;
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/sirasaki-konoha/minau/refs/heads/master/icon/minau-icon.png"
+)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/sirasaki-konoha/minau/refs/heads/master/icon/minau-icon.png"
+)]
 use std::{path::Path, process::exit};
+use clap::Parser;
 use url::Url;
-
-// `minau_core` ライブラリから必要なモジュールとマクロをインポートします
+use async_compat::CompatExt;
 use minau_core::{err, m3u, play_music, play_url};
 
 #[derive(Parser)]
@@ -26,8 +29,7 @@ const DEFAULT_VOLUME: u16 = 100;
 const MIN_VOLUME: u16 = 1;
 const MAX_VOLUME: u16 = 100;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = Cli::parse();
 
     let volume = args
@@ -52,30 +54,41 @@ async fn main() {
 
     for path in args.files {
         let path_extens: &Path = path.as_ref();
-        if let Some(ext) = path_extens.extension() {
-            if ext == "m3u" || ext == "m3u8" {
-                m3u::play_m3u(&path, volume, args.gui).await;
-                continue;
-            }
+        if let Some(ext) = path_extens.extension()
+            && (ext == "m3u" || ext == "m3u8")
+        {
+            smol::block_on(async {
+                m3u::play_m3u(&path, volume, args.gui).compat().await;
+            });
+            continue;
         }
 
         let bind = path.clone();
-        if let Ok(url) = Url::parse(&bind) {
-            match url.scheme() {
-                "file" => {
-                    if let Ok(file_path) = url.to_file_path() {
-                        play_music::play_music(&file_path, volume, args.gui, None).await;
-                        continue;
-                    }
-                }
-                "http" | "https" => {
-                    play_url::play_url(&bind, volume, None).await;
-                    continue;
-                }
-                _ => {}
+        if (bind.starts_with("file://")
+            || bind.starts_with("http://")
+            || bind.starts_with("https://"))
+            && let Ok(url) = Url::parse(&bind)
+        {
+            if let Ok(file_url) = url.to_file_path() {
+                smol::block_on(async {
+                    play_music::play_music(
+                        file_url.to_string_lossy().to_string(),
+                        volume,
+                        args.gui,
+                        None,
+                    )
+                    .await;
+                });
+                continue;
             }
+            smol::block_on(async {
+                play_url::play_url(&bind, volume, None).compat().await;
+            });
+            continue;
         }
 
-        play_music::play_music(&path, volume, args.gui, None).await;
+        smol::block_on(async {
+            play_music::play_music(&path, volume, args.gui, None).await;
+        });
     }
 }

@@ -5,9 +5,10 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State, Wry};
-use minau_core::player::{metadata::MetaData, play::MusicPlay, player_structs::Player};
+use tauri::{AppHandle, Emitter, State, Wry};
+use minau_core::player::{play::MusicPlay, player_structs::Player};
 use walkdir::WalkDir;
+use lazy_static::lazy_static;
 
 #[derive(serde::Serialize, Clone, Debug)]
 struct Track {
@@ -44,7 +45,7 @@ struct AppState {
     current_track_index: Arc<Mutex<Option<usize>>>,
 }
 
-lazy_static::lazy_static! {
+lazy_static! {
     static ref TRACK_ID_COUNTER: Mutex<u32> = Mutex::new(0);
 }
 
@@ -62,7 +63,10 @@ fn scan_music_folder() -> Vec<Track> {
                     "mp3" | "wav" | "flac" | "ogg" => {
                         if let Ok(player) = std::panic::catch_unwind(|| Player::new(path)) {
                             let metadata = player.metadata();
-                            let mut id_counter = TRACK_ID_COUNTER.lock().unwrap();
+                            let mut id_counter = match TRACK_ID_COUNTER.lock() {
+                                Ok(counter) => counter,
+                                Err(_) => continue,
+                            };
                             *id_counter += 1;
                             
                             let track = Track {
@@ -88,7 +92,9 @@ fn scan_music_folder() -> Vec<Track> {
 #[tauri::command]
 fn initialize_library(app_state: State<AppState>) -> PlayerStateSnapshot {
     let new_playlist = scan_music_folder();
-    *app_state.playlist.lock().unwrap() = new_playlist.clone();
+    if let Ok(mut playlist) = app_state.playlist.lock() {
+        *playlist = new_playlist.clone();
+    }
 
     PlayerStateSnapshot {
         status: PlaybackStatus::Stopped,
@@ -102,19 +108,27 @@ fn initialize_library(app_state: State<AppState>) -> PlayerStateSnapshot {
 
 #[tauri::command]
 fn play(track_id: u32, app_state: State<AppState>, app_handle: AppHandle) {
-    let playlist = app_state.playlist.lock().unwrap();
+    let playlist = match app_state.playlist.lock() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    
     if let Some(index) = playlist.iter().position(|t| t.id == track_id) {
         let track = &playlist[index];
         
         let player = Player::new(&track.path);
         let music_play = player.play().set_volume(0.8);
 
-        *app_state.playback_handle.lock().unwrap() = Some(music_play);
-        *app_state.current_track_index.lock().unwrap() = Some(index);
+        if let Ok(mut handle) = app_state.playback_handle.lock() {
+            *handle = Some(music_play);
+        }
+        if let Ok(mut idx) = app_state.current_track_index.lock() {
+            *idx = Some(index);
+        }
 
         let track_info_payload = serde_json::json!({ "index": index, "track": track });
-        app_handle.emit_all("track-changed", track_info_payload).unwrap();
-        app_handle.emit_all("playback-state-changed", PlaybackStatus::Playing).unwrap();
+        let _ = app_handle.emit("track-changed", track_info_payload);
+        let _ = app_handle.emit("playback-state-changed", PlaybackStatus::Playing);
         
         start_progress_emitter(app_handle.clone(), app_state.playback_handle.clone());
     }
@@ -122,58 +136,67 @@ fn play(track_id: u32, app_state: State<AppState>, app_handle: AppHandle) {
 
 #[tauri::command]
 fn pause(app_state: State<AppState>, app_handle: AppHandle) {
-    if let Some(handle) = app_state.playback_handle.lock().unwrap().as_mut() {
-        handle.pause();
-        app_handle.emit_all("playback-state-changed", PlaybackStatus::Paused).unwrap();
+    if let Ok(mut guard) = app_state.playback_handle.lock() {
+        if let Some(handle) = guard.as_mut() {
+            handle.pause();
+            let _ = app_handle.emit("playback-state-changed", PlaybackStatus::Paused);
+        }
     }
 }
 
 #[tauri::command]
 fn resume(app_state: State<AppState>, app_handle: AppHandle) {
-    if let Some(handle) = app_state.playback_handle.lock().unwrap().as_mut() {
-        handle.resume();
-        app_handle.emit_all("playback-state-changed", PlaybackStatus::Playing).unwrap();
+    if let Ok(mut guard) = app_state.playback_handle.lock() {
+        if let Some(handle) = guard.as_mut() {
+            handle.resume();
+            let _ = app_handle.emit("playback-state-changed", PlaybackStatus::Playing);
+        }
     }
 }
 
 #[tauri::command]
 fn seek(position_secs: u64, app_state: State<AppState>) {
-    if let Some(handle) = app_state.playback_handle.lock().unwrap().as_ref() {
-        let _ = handle.seek(Duration::from_secs(position_secs));
+    if let Ok(guard) = app_state.playback_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            let _ = handle.seek(Duration::from_secs(position_secs));
+        }
     }
 }
 
 #[tauri::command]
 fn set_volume(volume: f32, app_state: State<AppState>) {
-    if let Some(handle) = app_state.playback_handle.lock().unwrap().as_ref() {
-        handle.set_volume(volume);
+    if let Ok(mut guard) = app_state.playback_handle.lock() {
+        if let Some(handle) = guard.as_mut() {
+            handle.set_volume_mut(volume);
+        }
     }
 }
 
 #[tauri::command]
 fn get_album_art(track_id: u32, app_state: State<AppState>) -> Option<Vec<u8>> {
-    let playlist = app_state.playlist.lock().unwrap();
-    if let Some(track) = playlist.iter().find(|t| t.id == track_id) {
-        let player = Player::new(&track.path);
-        let metadata = player.metadata();
-        return metadata.picture();
-    }
-    None
+    let playlist = app_state.playlist.lock().ok()?;
+    let track = playlist.iter().find(|t| t.id == track_id)?;
+    let player = Player::new(&track.path);
+    let metadata = player.metadata();
+    metadata.picture()
 }
 
 fn start_progress_emitter(app_handle: AppHandle<Wry>, playback_handle: Arc<Mutex<Option<MusicPlay>>>) {
-    let handle_clone = Arc::clone(&playback_handle);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             
-            let handle_guard = handle_clone.lock().unwrap();
+            let handle_guard = match playback_handle.lock() {
+                Ok(guard) => guard,
+                Err(_) => break,
+            };
+            
             if let Some(handle) = handle_guard.as_ref() {
                 if handle.is_paused() { continue; }
                 if handle.is_empty() { break; }
 
                 let position = handle.get_pos();
-                app_handle.emit_all("playback-progress", serde_json::json!({ "position_secs": position.as_secs() })).unwrap();
+                let _ = app_handle.emit("playback-progress", serde_json::json!({ "position_secs": position.as_secs() }));
             } else {
                 break;
             }
@@ -186,7 +209,10 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create tokio runtime: {}", e);
+            std::process::exit(1);
+        });
 
     rt.block_on(async {
         tauri::Builder::default()
@@ -205,6 +231,9 @@ fn main() {
                 get_album_art
             ])
             .run(tauri::generate_context!())
-            .expect("error while running tauri application");
+            .unwrap_or_else(|e| {
+                eprintln!("Error while running tauri application: {}", e);
+                std::process::exit(1);
+            });
     });
 }

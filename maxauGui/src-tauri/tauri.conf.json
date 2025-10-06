@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "maxauGui",
+  "productName": "Maxau",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.nenia.maxau",
   "build": {
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "(cd .. && yarn build)",
+    "beforeBuildCommand": "yarn build",
     "frontendDist": "../dist"
   },
   "app": {

@@ -1,37 +1,46 @@
+#![allow(clippy::needless_range_loop)]
 use crate::input::deinit;
 use crate::{err, input};
+use async_channel::Receiver;
 use bytes::Bytes;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Stream, StreamConfig};
 use crossterm::cursor::MoveToPreviousLine;
 use crossterm::terminal::{self, Clear, ClearType, SetTitle};
 use crossterm::{cursor, execute};
 use http_body_util::BodyExt;
 use hyper::Request;
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use hyper_tls::HttpsConnector;
-use rodio::{OutputStream, Sink, Source};
+use parking_lot::Mutex;
+use ringbuf::HeapRb;
+use std::collections::VecDeque;
+use std::env;
 use std::io::{self, Read, Result as IoResult, Write, stdout};
 use std::process::exit;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use std::{env, thread};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(debug_assertions)]
+macro_rules! eprintln {
+    ($($msg: expr), *) => {
+        ::std::eprintln!($($msg), *);
+    };
+}
+
 struct StreamReader {
-    rx: mpsc::Receiver<Bytes>,
-    current: Option<Bytes>,
-    offset: usize,
-    buffer: Vec<u8>,
-    prebuffer_size: usize,
-    prebuffered: bool,
+    buffer: Arc<StdMutex<VecDeque<u8>>>,
+    eof: Arc<AtomicBool>,
 }
 
 impl symphonia::core::io::MediaSource for StreamReader {
@@ -54,144 +63,99 @@ impl std::io::Seek for StreamReader {
 }
 
 impl StreamReader {
-    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            rx,
-            current: None,
-            offset: 0,
-            buffer: Vec::new(),
-            prebuffer_size: 64 * 1024, // 512KB -> 64KB に削減
-            prebuffered: false,
-        }
-    }
+    fn new(rx: Receiver<Bytes>) -> Self {
+        let buffer = Arc::new(StdMutex::new(VecDeque::new()));
+        let eof = Arc::new(AtomicBool::new(false));
 
-    fn prebuffer(&mut self) -> IoResult<()> {
-        if self.prebuffered {
-            return Ok(());
-        }
+        let buffer_clone = Arc::clone(&buffer);
+        let eof_clone = Arc::clone(&eof);
 
-        while self.buffer.len() < self.prebuffer_size {
-            match self.rx.blocking_recv() {
-                Some(chunk) => {
-                    self.buffer.extend_from_slice(&chunk);
-                }
-                None => {
-                    if !self.buffer.is_empty() {
+        // バックグラウンドスレッドでバッファを満たし続ける
+        std::thread::spawn(move || {
+            loop {
+                // チャネルからチャンクを受信（ブロッキング）
+                match rx.recv_blocking() {
+                    Ok(chunk) => {
+                        // バッファに追加
+                        if let Ok(mut buf) = buffer_clone.lock() {
+                            buf.extend(chunk.iter());
+                        }
+                    }
+                    Err(_) => {
+                        eof_clone.store(true, Ordering::Relaxed);
                         break;
                     }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Stream ended before prebuffering completed",
-                    ));
                 }
             }
-        }
+        });
 
-        self.prebuffered = true;
-        Ok(())
+        Self { buffer, eof }
+    }
+
+    fn wait_for_data(&self, min_size: usize, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+
+        loop {
+            let size = {
+                match self.buffer.lock() {
+                    Ok(buf) => buf.len(),
+                    Err(_) => return false,
+                }
+            };
+
+            if size >= min_size || self.eof.load(Ordering::Relaxed) {
+                return true;
+            }
+
+            if start.elapsed() >= timeout {
+                eprintln!(
+                    "[StreamReader] Timeout waiting for {} bytes (have: {})",
+                    min_size, size
+                );
+                return false;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 impl Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        if !self.prebuffered {
-            self.prebuffer()?;
-        }
-
-        if !self.buffer.is_empty() {
-            let to_copy = self.buffer.len().min(buf.len());
-            buf[..to_copy].copy_from_slice(&self.buffer[..to_copy]);
-            self.buffer.drain(..to_copy);
-            return Ok(to_copy);
-        }
-
         loop {
-            if let Some(chunk) = &self.current {
-                if self.offset < chunk.len() {
-                    let remaining = chunk.len() - self.offset;
-                    let to_copy = remaining.min(buf.len());
-
-                    buf[..to_copy].copy_from_slice(&chunk[self.offset..self.offset + to_copy]);
-
-                    self.offset += to_copy;
+            // バッファからデータを取得
+            {
+                let mut buffer = match self.buffer.lock() {
+                    Ok(b) => b,
+                    Err(_) => return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to lock buffer"
+                    )),
+                };
+                if !buffer.is_empty() {
+                    let to_copy = buffer.len().min(buf.len());
+                    for i in 0..to_copy {
+                        if let Some(byte) = buffer.pop_front() {
+                            buf[i] = byte;
+                        }
+                    }
                     return Ok(to_copy);
                 }
             }
 
-            match self.rx.blocking_recv() {
-                Some(chunk) => {
-                    self.current = Some(chunk);
-                    self.offset = 0;
-                }
-                None => return Ok(0),
-            }
-        }
-    }
-}
-
-pub struct SymphoniaSource {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn symphonia::core::codecs::Decoder>,
-    track_id: u32,
-    sample_rate: u32,
-    channels: u16,
-    current_samples: Vec<f32>,
-    current_index: usize,
-    finished: Arc<Mutex<bool>>,
-}
-
-impl SymphoniaSource {
-    fn new(
-        format: Box<dyn FormatReader>,
-        decoder: Box<dyn symphonia::core::codecs::Decoder>,
-        track_id: u32,
-        sample_rate: u32,
-        channels: u16,
-    ) -> Self {
-        Self {
-            format,
-            decoder,
-            track_id,
-            sample_rate,
-            channels,
-            current_samples: Vec::new(),
-            current_index: 0,
-            finished: Arc::new(Mutex::new(false)),
-        }
-    }
-
-    fn decode_next_packet(&mut self) -> bool {
-        loop {
-            let packet = match self.format.next_packet() {
-                Ok(packet) => packet,
-                Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    *self.finished.lock().unwrap() = true;
-                    return false;
-                }
-                Err(_) => {
-                    *self.finished.lock().unwrap() = true;
-                    return false;
-                }
-            };
-
-            if packet.track_id() != self.track_id {
-                continue;
+            // バッファが空の場合
+            if self.eof.load(Ordering::Relaxed) {
+                return Ok(0);
             }
 
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    self.current_samples = convert_samples(decoded);
-                    self.current_index = 0;
-                    return true;
-                }
-                Err(_) => continue,
+            // データが来るまで少し待つ
+            if !self.wait_for_data(1, Duration::from_secs(5)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Timeout waiting for data",
+                ));
             }
         }
-    }
-
-    #[allow(unused)]
-    pub fn is_finished(&self) -> bool {
-        *self.finished.lock().unwrap()
     }
 }
 
@@ -204,96 +168,42 @@ fn convert_samples(buffer: AudioBufferRef) -> Vec<f32> {
     sample_buf.samples().to_vec()
 }
 
-impl Iterator for SymphoniaSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.current_index < self.current_samples.len() {
-                let sample = self.current_samples[self.current_index];
-                self.current_index += 1;
-                return Some(sample);
-            }
-
-            if !self.decode_next_packet() {
-                return None;
-            }
-        }
-    }
-}
-
-impl Source for SymphoniaSource {
-    fn current_frame_len(&self) -> Option<usize> {
-        None
-    }
-    fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
 pub struct UrlPlayer {
-    sink: Sink,
-    _stream: OutputStream,
-    _source: Arc<Mutex<Option<Arc<Mutex<SymphoniaSource>>>>>,
+    _stream: Stream,
+    paused: Arc<AtomicBool>,
+    volume: Arc<Mutex<f32>>,
+    finished: Arc<AtomicBool>,
     sample_rate: u32,
-    channel: u32,
+    channels: u32,
     downloaded_bytes: Arc<Mutex<u64>>,
     total_bytes: Arc<Mutex<Option<u64>>>,
 }
 
+unsafe impl Send for UrlPlayer {}
+
 impl UrlPlayer {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let (_stream, stream_handle) = OutputStream::try_default().unwrap_or_else(|e| {
-            err!("Failed to open audio stream: {}", e);
-            exit(1);
-        });
-
-        let sink = Sink::try_new(&stream_handle).unwrap_or_else(|e| {
-            err!("Failed to create sink: {}", e);
-            exit(1);
-        });
-
-        Ok(Self {
-            sink,
-            _stream,
-            sample_rate: 0,
-            channel: 0,
-            _source: Arc::new(Mutex::new(None)),
-            downloaded_bytes: Arc::new(Mutex::new(0)),
-            total_bytes: Arc::new(Mutex::new(None)),
-        })
-    }
-
     pub fn set_volume(&self, volume: f32) {
-        self.sink.set_volume(volume);
+        *self.volume.lock() = volume.clamp(0.0, 1.0);
     }
 
     pub fn get_volume(&self) -> f32 {
-        self.sink.volume()
+        *self.volume.lock()
     }
 
     pub fn pause(&self) {
-        self.sink.pause();
+        self.paused.store(true, Ordering::Relaxed);
     }
 
     pub fn resume(&self) {
-        self.sink.play();
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     pub fn is_paused(&self) -> bool {
-        self.sink.is_paused()
+        self.paused.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sink.empty()
+        self.finished.load(Ordering::Relaxed)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -301,11 +211,11 @@ impl UrlPlayer {
     }
 
     pub fn channels(&self) -> u32 {
-        self.channel
+        self.channels
     }
 
     pub fn get_downloaded_bytes(&self) -> u64 {
-        *self.downloaded_bytes.lock().unwrap()
+        *self.downloaded_bytes.lock()
     }
 
     pub fn get_downloaded_mb(&self) -> f64 {
@@ -313,7 +223,7 @@ impl UrlPlayer {
     }
 
     pub fn get_total_bytes(&self) -> Option<u64> {
-        *self.total_bytes.lock().unwrap()
+        *self.total_bytes.lock()
     }
 
     pub fn get_total_mb(&self) -> Option<f64> {
@@ -342,7 +252,7 @@ pub async fn setup_url_player(
         let uri = current_url.parse::<hyper::Uri>()?;
         let req = Request::builder()
             .uri(uri)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header("User-Agent", format!("minau/{}", env!("CARGO_PKG_VERSION")))
             .body(String::new())?;
 
         let resp = client.request(req).await?;
@@ -355,14 +265,14 @@ pub async fn setup_url_player(
 
             if let Some(location) = resp.headers().get("location") {
                 current_url = location.to_str()?.to_string();
-                
+
                 if !current_url.starts_with("http") {
                     let base_uri = url.parse::<hyper::Uri>()?;
                     let scheme = base_uri.scheme_str().unwrap_or("https");
                     let authority = base_uri.authority().ok_or("No authority in URL")?;
                     current_url = format!("{}://{}{}", scheme, authority, current_url);
                 }
-                
+
                 redirect_count += 1;
                 continue;
             } else {
@@ -383,109 +293,247 @@ pub async fn setup_url_player(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    let (tx, rx) = mpsc::channel::<Bytes>(1024); // 512 -> 1024に増加
+    // boundedチャネルを使用してバックプレッシャーを適用
+    let (tx, rx) = async_channel::bounded::<Bytes>(50);
 
     let downloaded_bytes = Arc::new(Mutex::new(0u64));
     let downloaded_clone = Arc::clone(&downloaded_bytes);
 
-    tokio::spawn(async move {
-        let mut body = response.into_body();
+    // 標準スレッドでダウンロードタスクを実行（ランタイム混在を回避）
+    std::thread::spawn(move || {
+        // 新しいsmolランタイムを作成
+        smol::block_on(async {
+            let mut body = response.into_body();
 
-        while let Some(result) = body.frame().await {
-            match result {
-                Ok(frame) => {
-                    if let Some(chunk) = frame.data_ref() {
-                        let chunk_size = chunk.len() as u64;
-                        *downloaded_clone.lock().unwrap() += chunk_size;
+            while let Some(result) = body.frame().await {
+                match result {
+                    Ok(frame) => {
+                        if let Some(chunk) = frame.data_ref() {
+                            let chunk_size = chunk.len() as u64;
+                            *downloaded_clone.lock() += chunk_size;
 
-                        if tx.send(chunk.clone()).await.is_err() {
-                            break;
+                            match tx.send(chunk.clone()).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    err!("Stream Error: {}", e);
-                    break;
+                    Err(e) => {
+                        err!("Stream Error: {}", e);
+                        break;
+                    }
                 }
             }
-        }
+            drop(tx);
+        })
     });
 
     let downloaded_bytes_clone = Arc::clone(&downloaded_bytes);
-    
-    // スレッドを使わずに直接実行
-    let mut reader = StreamReader::new(rx);
-    
-    let buffered_size = 128 * 1024; // 1MB -> 128KB に削減
+    let player = std::thread::spawn(
+        move || -> Result<UrlPlayer, Box<dyn std::error::Error + Send + Sync>> {
+            let reader = StreamReader::new(rx);
 
-    let mut hint = Hint::new();
-    
-    reader.prebuffer()?;
-
-    // ファイルタイプ検出のためのバッファサイズを削減
-    let detect_size = reader.buffer.len().min(2000);
-    if let Some(kind) = infer::get(&reader.buffer[..detect_size]) {
-        match kind.mime_type() {
-            "audio/mpeg" => hint.with_extension("mp3"),
-            "audio/flac" => hint.with_extension("flac"),
-            "audio/ogg" => hint.with_extension("ogg"),
-            "audio/wav" => hint.with_extension("wav"),
-            "audio/aac" => hint.with_extension("aac"),
-            "audio/mp4" => hint.with_extension("m4a"),
-            _ => {
-                err!("Stream is not supported mime type!");
-                exit(1);
+            // 初期バッファリング
+            if !reader.wait_for_data(64 * 1024, Duration::from_secs(10)) {
+                return Err("Failed to buffer initial data".into());
             }
-        };
-    }
 
-    let mss = MediaSourceStream::new(
-        Box::new(reader),
-        symphonia::core::io::MediaSourceStreamOptions {
-            buffer_len: buffered_size,
-        }
-    );
+            let buffered_size = 256 * 1024;
+            let mut hint = Hint::new();
 
-    let meta_opts: MetadataOptions = Default::default();
-    let fmt_opts: FormatOptions = Default::default();
+            // フォーマット検出
+            let detect_buf: Vec<u8> = {
+                let buffer = match reader.buffer.lock() {
+                    Ok(b) => b,
+                    Err(_) => return Err("Failed to lock buffer for format detection".into()),
+                };
+                let detect_size = buffer.len().min(2000);
+                buffer.iter().take(detect_size).copied().collect()
+            };
 
-    let probed =
-        symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
+            if let Some(kind) = infer::get(&detect_buf) {
+                match kind.mime_type() {
+                    "audio/mpeg" => hint.with_extension("mp3"),
+                    "audio/flac" => hint.with_extension("flac"),
+                    "audio/ogg" => hint.with_extension("ogg"),
+                    "audio/wav" => hint.with_extension("wav"),
+                    "audio/aac" => hint.with_extension("aac"),
+                    "audio/mp4" => hint.with_extension("m4a"),
+                    _ => {
+                        err!("Stream is not supported mime type!");
+                        exit(1);
+                    }
+                };
+            }
 
-    let format = probed.format;
+            let mss = MediaSourceStream::new(
+                Box::new(reader),
+                symphonia::core::io::MediaSourceStreamOptions {
+                    buffer_len: buffered_size,
+                },
+            );
 
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or("Track not found")?;
+            let meta_opts: MetadataOptions = Default::default();
+            let fmt_opts: FormatOptions = Default::default();
 
-    let track_id = track.id;
-    let codec_params = &track.codec_params;
+            let probed =
+                symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
 
-    let sample_rate = codec_params
-        .sample_rate
-        .ok_or("Samplerate is not available")?;
-    let channels = codec_params.channels.ok_or("Channels is not available")?;
+            let format = probed.format;
 
-    let dec_opts: DecoderOptions = Default::default();
-    let decoder = symphonia::default::get_codecs().make(codec_params, &dec_opts)?;
+            let track = format
+                .tracks()
+                .iter()
+                .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+                .ok_or("Track not found")?;
 
-    let source = SymphoniaSource::new(
-        format,
-        decoder,
-        track_id,
-        sample_rate,
-        channels.count() as u16,
-    );
+            let track_id = track.id;
+            let codec_params = &track.codec_params;
 
-    let mut player = UrlPlayer::new().unwrap();
-    player.set_volume(volume);
-    player.downloaded_bytes = downloaded_bytes_clone;
-    *player.total_bytes.lock().unwrap() = total_bytes;
-    player.sink.append(source.buffered());
-    player.channel = channels.count() as u32;
-    player.sample_rate = sample_rate;
+            let sample_rate = codec_params
+                .sample_rate
+                .ok_or("Samplerate is not available")?;
+            let channels = codec_params.channels.ok_or("Channels is not available")?;
+            let channels_count = channels.count() as u16;
+
+            let dec_opts: DecoderOptions = Default::default();
+            let decoder = symphonia::default::get_codecs().make(codec_params, &dec_opts)?;
+
+            // cpal setup
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or("No output device available")?;
+            let deivce_config = device.default_output_config()
+                .map_err(|e| format!("Failed to get default output config: {}", e))?;
+
+            let config = StreamConfig {
+                channels: deivce_config.channels(),
+                sample_rate: deivce_config.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            };
+
+            let paused = Arc::new(AtomicBool::new(false));
+            let volume_arc = Arc::new(Mutex::new(volume));
+            let finished = Arc::new(AtomicBool::new(false));
+
+            let format = Arc::new(StdMutex::new(format));
+            let decoder = Arc::new(StdMutex::new(decoder));
+
+            let (mut producer, mut consumer) = HeapRb::<f32>::new(sample_rate as usize * 2).split();
+
+            let format_clone = Arc::clone(&format);
+            let decoder_clone = Arc::clone(&decoder);
+            let finished_clone = Arc::clone(&finished);
+
+            // Decoder thread
+            std::thread::spawn(move || {
+                let mut current_samples = Vec::new();
+                let mut current_index = 0;
+
+                loop {
+                    if finished_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Fill buffer
+                    while producer.free_len() > 4096 {
+                        if current_index >= current_samples.len() {
+                            // Decode next packet
+                            let mut format = match format_clone.lock() {
+                                Ok(f) => f,
+                                Err(_) => break,
+                            };
+                            let mut decoder = match decoder_clone.lock() {
+                                Ok(d) => d,
+                                Err(_) => break,
+                            };
+
+                            let packet = match format.next_packet() {
+                                Ok(packet) => packet,
+                                Err(Error::IoError(e))
+                                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                                {
+                                    finished_clone.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("[Decoder] Error reading packet: {:?}", e);
+                                    finished_clone.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            };
+
+                            if packet.track_id() != track_id {
+                                continue;
+                            }
+
+                            match decoder.decode(&packet) {
+                                Ok(decoded) => {
+                                    current_samples = convert_samples(decoded);
+                                    current_index = 0;
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+
+                        if current_index < current_samples.len() {
+                            let sample = current_samples[current_index];
+                            if producer.push(sample).is_err() {
+                                break;
+                            }
+                            current_index += 1;
+                        }
+                    }
+
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+
+            let paused_stream = Arc::clone(&paused);
+            let volume_stream = Arc::clone(&volume_arc);
+
+            let stream = device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if paused_stream.load(Ordering::Relaxed) {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        return;
+                    }
+
+                    let vol = *volume_stream.lock();
+
+                    for sample in data.iter_mut() {
+                        *sample = consumer.pop().unwrap_or(0.0) * vol;
+                    }
+                },
+                move |err| {
+                    err!("Stream error: {}", err);
+                },
+                None,
+            )?;
+
+            stream.play()?;
+
+            Ok(UrlPlayer {
+                _stream: stream,
+                paused,
+                volume: volume_arc,
+                finished,
+                sample_rate,
+                channels: channels_count as u32,
+                downloaded_bytes: downloaded_bytes_clone,
+                total_bytes: Arc::new(Mutex::new(total_bytes)),
+            })
+        },
+    )
+    .join()
+    .map_err(|e| format!("Player thread panicked: {:?}", e))?
+    .map_err(|e| format!("Player creation failed: {}", e))?;
 
     Ok(player)
 }
@@ -509,10 +557,7 @@ pub async fn play_url(url: &str, volume: f32, title_override: Option<String>) {
     let key_state = Arc::new(Mutex::new(false));
 
     println!("{}", title);
-    
-    // LocalSetを使ってSend制約なしでタスクを実行
-    let local = tokio::task::LocalSet::new();
-    let thread = local.spawn_local(input::get_input_url_mode(
+    let thread = smol::spawn(input::get_input_url_mode(
         Arc::clone(&player),
         title.clone(),
         key_state.clone(),
@@ -523,40 +568,41 @@ pub async fn play_url(url: &str, volume: f32, title_override: Option<String>) {
     let mut first = false;
 
     loop {
-        thread::sleep(Duration::from_millis(200));
+        smol::Timer::after(Duration::from_millis(200)).await;
 
         let locked = Arc::clone(&player);
-        let locked = locked.lock().unwrap();
+        let locked = locked.lock();
 
         if !first {
-            execute!(
+            let _ = execute!(
                 stdout(),
                 cursor::MoveToColumn(0),
                 Clear(ClearType::CurrentLine)
-            )
-            .unwrap();
+            );
         } else {
             first = !first;
         }
 
         if let Some(progress) = locked.get_download_progress() {
-            print!(
-                "{:.1}% ({:.2} / {:.2} MB)",
-                progress,
-                locked.get_downloaded_mb(),
-                locked.get_total_mb().unwrap(),
-            );
+            if let Some(total_mb) = locked.get_total_mb() {
+                print!(
+                    "{:.1}% ({:.2} / {:.2} MB)",
+                    progress,
+                    locked.get_downloaded_mb(),
+                    total_mb,
+                );
+            }
         } else {
             print!("({:.2} MB)", locked.get_downloaded_mb());
         }
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
 
         if thread.is_finished() {
             cleanup_and_exit(&title);
             break;
         }
         if locked.is_empty() {
-            *key_state.lock().unwrap() = true;
+            *key_state.lock() = true;
             cleanup_and_exit(&title);
             break;
         }
@@ -564,14 +610,16 @@ pub async fn play_url(url: &str, volume: f32, title_override: Option<String>) {
 }
 
 fn set_terminal_title(title: &str) {
-    execute!(stdout(), SetTitle(title.to_string())).unwrap();
+    let _ = execute!(stdout(), SetTitle(title.to_string()));
 }
 
 fn reset_terminal_title() {
-    let cwd = env::current_dir().unwrap().display().to_string();
-    execute!(stdout(), SetTitle(cwd)).unwrap();
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| String::from("~"));
+    let _ = execute!(stdout(), SetTitle(cwd));
     print!("\x1b]2;\x07");
-    stdout().flush().unwrap();
+    let _ = stdout().flush();
 }
 
 fn cleanup_and_exit(title: &str) {

@@ -1,24 +1,25 @@
+use crate::{display_image, display_info, err};
 use crate::display_info::string_info;
 use crate::input::{deinit, get_input};
 use crate::player::metadata::MetaData;
 use crate::player::player_structs::Player;
-use crate::{display_image, display_info};
 use crossterm::cursor::MoveToPreviousLine;
 use crossterm::terminal::ClearType;
 use crossterm::terminal::{Clear, SetTitle};
 use crossterm::{execute, terminal};
 use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
+use parking_lot::Mutex;
 use std::env;
 use std::io::{Write, stdout};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::thread::sleep;
 use std::time::Duration;
-use tokio::time::sleep;
 use unicode_width::UnicodeWidthStr;
 
-const TICK_INTERVAL_MS: u64 = 100;
-const TICKS_PER_SECOND: u32 = 4;
+const TICK_INTERVAL_MS: u64 = 2000;
+const UPDATE_INTERVAL_SECS: u64 = 1; // 1秒ごとに更新
 
 pub async fn play_music<P: AsRef<Path>>(
     path: P,
@@ -36,9 +37,8 @@ pub async fn play_music<P: AsRef<Path>>(
     let filename = path
         .as_ref()
         .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
         .to_string();
 
     let path_display = path.as_ref().display().to_string();
@@ -52,38 +52,42 @@ pub async fn play_music<P: AsRef<Path>>(
     let bind = path_display.clone();
     let bind_clg = Arc::clone(&close_gui);
     let play_thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        smol::block_on(async {
             really_play(player_bind, value, file_clone, bind, volume).await;
-            let mut clg = bind_clg.lock().unwrap();
+            let mut clg = bind_clg.lock();
             *clg = true;
         });
     });
 
-    if gui {
-        if let Some(pic) = metadata.picture() {
-            if env::var("WAYLAND_DISPLAY").is_ok() {
-                unsafe { env::remove_var("WAYLAND_DISPLAY") };
-            }
-            display_image::display(pic, &filename, metadata, close_gui);
+    if gui && let Some(pic) = metadata.picture() {
+        if env::var("WAYLAND_DISPLAY").is_ok() {
+            // Note: Removing WAYLAND_DISPLAY for X11 compatibility with minifb
+            // This is necessary but inherently unsafe in multithreaded contexts
+            unsafe { env::remove_var("WAYLAND_DISPLAY") };
         }
+        display_image::display(pic, &filename, metadata, close_gui);
     }
 
-    play_thread.join().unwrap();
+    if let Err(e) = play_thread.join() {
+        err!("Play thread panicked: {:?}", e);
+    }
 
     reset_terminal_title();
 }
 
 fn set_terminal_title(filename: &str, metadata: &MetaData) {
-    execute!(stdout(), SetTitle(string_info(filename, metadata))).unwrap();
+    let _ = execute!(stdout(), SetTitle(string_info(filename, metadata)));
 }
 
 fn reset_terminal_title() {
-    let cwd = env::current_dir().unwrap().display().to_string();
-    execute!(stdout(), SetTitle(cwd)).unwrap();
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| String::from("~"));
+    let _ = execute!(stdout(), SetTitle(cwd));
     print!("\x1b]2;\x07");
-    stdout().flush().unwrap();
+    let _ = stdout().flush();
 }
+
 
 async fn really_play(
     player: Player,
@@ -106,9 +110,7 @@ async fn really_play(
     let music_play = Arc::new(Mutex::new(player.play().set_volume(volume)));
     let key_state = Arc::new(Mutex::new(false));
 
-    // LocalSetを使ってSend制約なしでタスクを実行
-    let local = tokio::task::LocalSet::new();
-    let key_thread = local.spawn_local(get_input(
+    let key_thread = smol::spawn(get_input(
         Arc::clone(&music_play),
         Arc::clone(&key_state),
         filename.clone(),
@@ -119,7 +121,8 @@ async fn really_play(
     let duration_secs = duration.as_secs();
     let pb = create_progress_bar(duration_secs);
 
-    let mut tick_count = 0u32;
+    let mut last_update = std::time::Instant::now();
+    let mut last_pos = 0u64;
 
     loop {
         if key_thread.is_finished() {
@@ -127,22 +130,25 @@ async fn really_play(
             return;
         }
 
-        if music_play.lock().unwrap().is_empty() {
-            *key_state.lock().unwrap() = true;
+        if music_play.lock().is_empty() {
+            *key_state.lock() = true;
             cleanup_and_exit(&pb, metadata, &filename);
             return;
         }
 
-        sleep(Duration::from_millis(TICK_INTERVAL_MS)).await;
+        sleep(Duration::from_millis(TICK_INTERVAL_MS));
 
-        if !music_play.lock().unwrap().is_paused() {
-            tick_count += 1;
-
-            if tick_count >= TICKS_PER_SECOND {
-                tick_count = 0;
-                let current_secs = music_play.lock().unwrap().get_pos().as_secs();
+        // 一定間隔でのみプログレスバーを更新
+        if last_update.elapsed() >= Duration::from_secs(UPDATE_INTERVAL_SECS) {
+            let current_secs = music_play.lock().get_pos().as_secs();
+            
+            // 位置が実際に変わった場合のみ更新
+            if current_secs != last_pos {
                 update_progress(&pb, current_secs, duration_secs);
+                last_pos = current_secs;
             }
+            
+            last_update = std::time::Instant::now();
         }
     }
 }
@@ -152,7 +158,7 @@ fn create_progress_bar(duration: u64) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{bar:40.yellow} {msg}")
-            .unwrap()
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("# "),
     );
     pb.set_position(0);
@@ -178,20 +184,18 @@ fn cleanup_and_exit(pb: &ProgressBar, metadata: MetaData, path: &str) {
     let (cols, _rows) = terminal::size().unwrap_or((80, 24));
     let lines_needed = (text_width as u16).div_ceil(cols).max(1) - 1;
 
-    execute!(
+    let _ = execute!(
         std::io::stdout(),
         MoveToPreviousLine(2),
         Clear(crossterm::terminal::ClearType::FromCursorDown),
-    )
-    .unwrap();
+    );
 
     for _ in 0..lines_needed {
-        execute!(
+        let _ = execute!(
             std::io::stdout(),
             MoveToPreviousLine(1),
             Clear(ClearType::FromCursorDown),
-        )
-        .unwrap();
+        );
     }
 
     pb.finish_and_clear();

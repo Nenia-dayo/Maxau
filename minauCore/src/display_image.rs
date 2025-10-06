@@ -1,12 +1,8 @@
 use crate::{display_info::string_info, err, player::metadata::MetaData};
 use image::GenericImageView;
 use minifb::{Window, WindowOptions};
-use std::{
-    process::exit,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use parking_lot::Mutex;
+use std::{process::exit, sync::Arc, thread, time::Duration};
 
 pub fn display(data: Vec<u8>, filename: &str, metadata: MetaData, close: Arc<Mutex<bool>>) {
     let img = image::load_from_memory(&data).unwrap_or_else(|e| {
@@ -17,7 +13,7 @@ pub fn display(data: Vec<u8>, filename: &str, metadata: MetaData, close: Arc<Mut
     let (width, height) = img.dimensions();
     let (mut last_width, mut last_height) = (width as usize, height as usize);
 
-    let mut window = Window::new(
+    let mut window = match Window::new(
         &string_info(filename, &metadata),
         last_width,
         last_height,
@@ -25,8 +21,13 @@ pub fn display(data: Vec<u8>, filename: &str, metadata: MetaData, close: Arc<Mut
             resize: true,
             ..WindowOptions::default()
         },
-    )
-    .unwrap();
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            err!("Failed to create window: {}", e);
+            return;
+        }
+    };
 
     let mut buffer: Vec<u32> = img
         .to_rgb8()
@@ -34,20 +35,16 @@ pub fn display(data: Vec<u8>, filename: &str, metadata: MetaData, close: Arc<Mut
         .map(|px| u32::from_be_bytes([0, px[0], px[1], px[2]]))
         .collect();
 
-    window
-        .update_with_buffer(&buffer, last_width, last_height)
-        .unwrap();
+    let _ = window.update_with_buffer(&buffer, last_width, last_height);
     thread::sleep(Duration::from_millis(100));
-    window
-        .update_with_buffer(&buffer, last_width, last_height)
-        .unwrap();
+    let _ = window.update_with_buffer(&buffer, last_width, last_height);
 
     while window.is_open()
         && !window.is_key_down(minifb::Key::Escape)
         && !window.is_key_down(minifb::Key::Q)
     {
         thread::sleep(Duration::from_millis(200));
-        if *close.lock().unwrap() {
+        if *close.lock() {
             break;
         }
 
@@ -68,9 +65,7 @@ pub fn display(data: Vec<u8>, filename: &str, metadata: MetaData, close: Arc<Mut
 
             last_width = width;
             last_height = height;
-            window
-                .update_with_buffer(&buffer, last_width, last_height)
-                .unwrap();
+            let _ = window.update_with_buffer(&buffer, last_width, last_height);
         } else {
             window.update();
         }

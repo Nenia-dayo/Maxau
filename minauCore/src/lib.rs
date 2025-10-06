@@ -7,3 +7,6 @@ pub mod macros;
 pub mod play_music;
 pub mod play_url;
 pub mod player;
+
+// Re-export crossterm for macros
+pub use crossterm;

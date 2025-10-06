@@ -1,4 +1,7 @@
-use lofty::{AudioFile, Probe, FileProperties, TaggedFileExt, Accessor, Tag};
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::probe::Probe;
+use lofty::properties::FileProperties;
+use lofty::tag::{Accessor, Tag};
 use std::fs::File;
 use std::io::BufReader;
 use std::process::exit;
@@ -45,9 +48,9 @@ impl MetaData {
     pub fn title(&self) -> Option<String> {
         if self.title.is_some() {
             self.title.clone()
-        }else if let Some(tag) = &self.tag.clone() {
+        } else if let Some(tag) = &self.tag.clone() {
             tag.title().as_ref().map(|title| title.to_string())
-        }else {
+        } else {
             None
         }
     }
@@ -74,10 +77,10 @@ impl MetaData {
 
     /// returns first of picture data
     pub fn picture(&self) -> Option<Vec<u8>> {
-        if let Some(s) = self.tag.clone() {
-            if let Some(pic) = s.pictures().first() {
-                return Some(pic.data().to_vec());
-            }
+        if let Some(s) = self.tag.clone()
+            && let Some(s) = s.pictures().first()
+        {
+            return Some(s.data().to_vec());
         }
         None
     }
