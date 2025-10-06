@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { usePlayerStore } from '@/stores/playerStore';
 import { tauriApi } from '@/lib/tauriApi';
 import { arrayBufferToUrl } from '@/lib/arrayBufferToUrl';
