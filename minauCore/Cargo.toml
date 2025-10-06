@@ -1,14 +1,12 @@
-[workspace]
-resolver = "2"
-members = [
-    "minauCli",
-    "maxauGui/src-tauri",
-    "minauCore",
-]
+[package]
+name = "minau-core"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+authors = ["Nenia-dayo"]
+description = "Core library for the Maxau music player"
 
-[workspace.dependencies]
-# ここにワークスペース全体で共有する依存関係を定義
-# minauCoreの依存関係
+[dependencies]
 bytes = "1.6.0"
 crossterm = "0.27.0"
 futures-util = "0.3.30"
@@ -31,15 +29,5 @@ url = "2.5.2"
 walkdir = "2.5.0"
 lazy_static = "1.4.0"
 dirs = "5.0.1"
-
-# minauCliの依存関係
-clap = { version = "4.5.4", features = ["derive"] }
-humantime = "2.1.0"
-indicatif = "0.17.8"
-
-# maxauGuiの依存関係
-tauri = { version = "2.0.0-beta", features = [] }
-tauri-plugin-shell = "2.0.0-beta"
-
-# minauCore自体も共有依存関係として定義
-minau-core = { path = "./minauCore" }
+humantime.workspace = true
+indicatif.workspace = true

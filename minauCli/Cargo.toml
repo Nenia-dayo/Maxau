@@ -1,0 +1,27 @@
+[package]
+name = "minau-cli"
+version = "0.2.6"
+edition = "2021" # 2024から2021に変更
+license = "BSD-3-Clause"
+authors = ["sirasaki-konoha konoha@pik6c.tech"]
+description = "A simple, minimal music player"
+
+[dependencies]
+minau-core = { path = "../minauCore" } # 依存関係を追加
+clap = { version = "4.5.4", features = ["derive"] }
+crossterm = "0.27.0"
+humantime = "2.1.0"
+indicatif = "0.17.8"
+tokio = { version = "1.37.0", features = ["full"] }
+unicode-width = "0.1.11"
+url = "2.5.2"
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = "debuginfo"
+panic = "abort"
+overflow-checks = false
+lto = "fat"
+codegen-units = 1
+
