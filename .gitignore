@@ -66,6 +66,9 @@ vite.config.*.timestamp-*
 # ============================================
 # IDE / Editor
 # ============================================
+# Visual Studio
+.vs/
+
 # VSCode
 .vscode/*
 !.vscode/settings.json
