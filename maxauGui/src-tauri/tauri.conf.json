@@ -5,6 +5,7 @@
   "identifier": "com.nenia.maxau",
   "build": {
     "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "yarn dev",
     "beforeBuildCommand": "yarn build",
     "frontendDist": "../dist"
   },

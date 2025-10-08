@@ -16,7 +16,7 @@
   </Properties>
   
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
   
   <Resources>
@@ -58,9 +58,16 @@
   </Applications>
   
   <Capabilities>
-    <rescap:Capability Name="runFullTrust" />
+    <!-- UWP互換Capabilities -->
     <uap:Capability Name="musicLibrary" />
     <Capability Name="internetClient" />
     <Capability Name="internetClientServer" />
+    
+    <!-- Win32 App Isolation Capabilities -->
+    <!-- ミュージックライブラリ外のファイルアクセス時にプロンプト表示 -->
+    <rescap:Capability Name="isolatedWin32-promptForAccess" />
+    
+    <!-- 最小限のユーザープロファイルアクセス（設定保存など） -->
+    <rescap:Capability Name="isolatedWin32-userProfileMinimal" />
   </Capabilities>
 </Package>
