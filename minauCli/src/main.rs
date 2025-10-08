@@ -82,7 +82,10 @@ fn main() {
                 continue;
             }
             smol::block_on(async {
-                play_url::play_url(&bind, volume, None).compat().await;
+                if let Err(e) = play_url::play_url(&bind, volume, None::<String>).compat().await {
+                    err!("Failed to play URL: {}", e);
+                    exit(1);
+                }
             });
             continue;
         }

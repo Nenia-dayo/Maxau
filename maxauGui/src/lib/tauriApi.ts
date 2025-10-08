@@ -14,7 +14,7 @@ export const tauriApi = {
   /**
    * バックエンドに音楽ライブラリの再スキャンを要求します。
    */
-  rescanLibrary: (): Promise<void> => {
+  rescanLibrary: (): Promise<PlayerState> => {
     return invoke('rescan_library');
   },
 
@@ -24,6 +24,14 @@ export const tauriApi = {
    */
   play: (trackId: number): Promise<void> => {
     return invoke('play', { trackId });
+  },
+
+  /**
+   * 指定されたURLから音楽を再生するようにバックエンドに要求します。
+   * @param url 再生するHTTP/HTTPSのURL
+   */
+  playUrl: (url: string): Promise<void> => {
+    return invoke('play_url', { url });
   },
 
   /**

@@ -538,16 +538,36 @@ pub async fn setup_url_player(
     Ok(player)
 }
 
-pub async fn play_url(url: &str, volume: f32, title_override: Option<String>) {
+pub async fn play_url<T>(url: &str, volume: f32, title_override: Option<T>) -> Result<(), Box<dyn std::error::Error>> {
     let p = match setup_url_player(url, volume).await {
         Ok(player) => player,
         Err(e) => {
             err!("Failed to setup url player: {}", e);
-            return;
+            return Err(e);
         }
     };
 
-    let title = title_override.unwrap_or_else(|| url.to_string());
+    let title = url.to_string();
+    
+    // GUI mode: title_overrideがSomeの場合はGUIモード（インタラクティブではない）
+    if title_override.is_some() {
+        // GUIモード: 単にプレーヤーを保持して終了
+        // イベントループは別スレッドで管理される
+        let player = Arc::new(Mutex::new(p));
+        
+        loop {
+            smol::Timer::after(Duration::from_millis(500)).await;
+            
+            let locked = player.lock();
+            if locked.is_empty() {
+                break;
+            }
+        }
+        
+        return Ok(());
+    }
+    
+    // CLI mode: ターミナル表示とキー入力を処理
     println!(
         "{}kHz/{}ch | Unknown",
         p.sample_rate() as f32 / 1000.0,
@@ -607,6 +627,8 @@ pub async fn play_url(url: &str, volume: f32, title_override: Option<String>) {
             break;
         }
     }
+    
+    Ok(())
 }
 
 fn set_terminal_title(title: &str) {

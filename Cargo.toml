@@ -6,6 +6,10 @@ members = [
     "minauCore",
 ]
 
+# セキュリティと安定性のための設定
+[profile.dev]
+opt-level = 1
+
 [workspace.dependencies]
 # minauCoreの依存関係（v0.3.0に対応）
 anyhow = "1.0.92"
@@ -47,11 +51,13 @@ tauri-plugin-shell = "2.0.0-beta"
 
 # minauCore自体も共有依存関係として定義
 minau-core = { path = "./minauCore" }
+
+# セキュリティ強化されたリリースプロファイル
 [profile.release]
-opt-level = 3
-debug = false
-strip = "debuginfo"
-panic = "abort"
-overflow-checks = false
-lto = "fat"
-codegen-units = 1
+opt-level = 3          # 最大最適化
+lto = "fat"            # Full Link Time Optimization
+codegen-units = 1      # 単一コード生成ユニット（最適化優先）
+strip = "debuginfo"    # デバッグシンボル削除
+panic = "abort"        # パニック時即終了（スタック展開なし）
+debug = false          # デバッグ情報なし
+overflow-checks = false # リリースビルドではオーバーフローチェック無効

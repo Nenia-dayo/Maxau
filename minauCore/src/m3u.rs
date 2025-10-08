@@ -69,7 +69,10 @@ pub async fn play_m3u<P: AsRef<Path>>(path: P, volume: f32, gui: bool) {
                 .await;
                 continue;
             }
-            play_url::play_url(&entry.path, volume, entry.title).await;
+            // URL再生: CLIモードでは title_override に None を渡す
+            if let Err(e) = play_url::play_url(&entry.path, volume, None::<String>).await {
+                err!("Failed to play URL {}: {}", entry.path, e);
+            }
             continue;
         }
 
