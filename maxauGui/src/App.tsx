@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { usePlayerStore } from './stores/playerStore';
 import { NowPlayingStage } from './components/NowPlayingStage';
 import { MusicLibrary } from './components/MusicLibrary';
+import { UrlPlayback } from './components/UrlPlayback';
 
 function App() {
   const { initialize, isInitialized } = usePlayerStore();
@@ -44,6 +45,10 @@ function App() {
         <main className="space-y-8">
           <section>
             <NowPlayingStage />
+          </section>
+          
+          <section>
+            <UrlPlayback />
           </section>
           
           <section>
